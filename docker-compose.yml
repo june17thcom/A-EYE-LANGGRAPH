@@ -1,0 +1,11 @@
+services:
+  wearable-langgraph:
+    build: .
+    container_name: wearable-langgraph
+    env_file:
+      - .env
+    ports:
+      - "8010:8000" # 호스트 8010 → 컨테이너 내부 8000
+    volumes:
+      - ./images:/app/images:rw
+    restart: unless-stopped

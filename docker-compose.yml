@@ -1,11 +1,26 @@
+version: "3.8"
+
 services:
   wearable-langgraph:
-    build: .
     container_name: wearable-langgraph
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: a-eye-langgraph-wearable-langgraph
     env_file:
-      - .env
+      - .env # OPENAI_API_KEY 등은 여기서 주입
+    environment:
+      TZ: Asia/Seoul # 로그/시간대 일치
+      LOG_LEVEL: INFO # DEBUG로 바꾸면 상세 로그
+      IMAGE_API_BASE: "http://127.0.0.1:8000" # 컨테이너 내부 FastAPI
+      PERCEPTION_API_BASE: "http://127.0.0.1:8000" # YOLO/GAZE 엔드포인트 동일 호스트
     ports:
-      - "8010:8000" # 호스트 8010 → 컨테이너 내부 8000
+      - "8010:8000" # 호스트 8010 → 컨테이너 8000
     volumes:
-      - ./images:/app/images:rw
+      - ./images:/app/images:rw # 업로드/최근 프레임 보존
     restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://127.0.0.1:8000/health || exit 1"]
+      interval: 15s
+      timeout: 5s
+      retries: 5

@@ -1,6 +1,7 @@
 import os
+import json
 import logging
-from typing import Annotated, Literal, TypedDict, Optional, Any, Dict
+from typing import Annotated, Literal, TypedDict, Optional, Any, Dict, List
 from dotenv import load_dotenv
 
 from langgraph.graph import StateGraph, START, END
@@ -12,7 +13,7 @@ from langchain_core.messages import SystemMessage, HumanMessage, ToolMessage, AI
 from langchain_core.tools import BaseTool
 
 from schema import FinalResponse
-from tools import get_tools  # ← weather_now, image_lookup, web_search 포함
+from tools import get_tools  # weather_now, image_lookup/image_recent, yolo_scene, gaze_depth_status, web_search(옵션)
 
 load_dotenv()
 
@@ -34,11 +35,16 @@ SYSTEM_PROMPT = """\
 날씨가 물어보이면:
 - 이전 메시지 중 '사용자 좌표(lat,lon): a,b'가 있으면 그 좌표로 weather_now(lat=a, lon=b) 도구를 호출해 현재 상태를 요약해.
 - 좌표가 없으면 일반 조언 대신, 도시/위치 질문을 한 줄로만 붙여. (그러나 먼저 가능한 가정으로 간단 요약은 제공)
-이미지 관련이면 image_lookup를 우선 고려하고, 외부 사실 보강이 필요하면 web_search로 2~3개 출처 이름만 첨언해.
+
+이미지 관련이면 image_recent(세션 최신) 또는 image_lookup(키워드)을 우선 고려하고,
+외부 사실 보강이 필요하면 web_search로 2~3개 출처 '이름만' 첨언해(링크 낭독 금지).
+
+yolo_scene 결과가 있으면 객체 수량/상태를 한 줄로 요약하고, 안전 행동을 최대 3포인트로 말해.
+gaze_depth_status 결과에서 위험도가 'high'면 즉시 경고부터 말하고, 회피 행동을 1~2줄로 말해.
 """
 
 def _ellipsize(s: str, n: int = 200) -> str:
-    s = s.replace("\n", " ")
+    s = (s or "").replace("\n", " ")
     return s if len(s) <= n else s[:n] + "..."
 
 def _get_role_and_content(msg: Any):
@@ -57,7 +63,12 @@ def _get_role_and_content(msg: Any):
     return (str(role) if role else None), (str(content) if content else "")
 
 class LoggedToolNode:
-    def __init__(self, tools: list[BaseTool]):
+    """
+    툴 실행/로깅을 안정적으로 처리한다:
+    - 결과는 항상 JSON 문자열(ensure_ascii=False)로 ToolMessage에 기록
+    - 예외 발생 시 구조화된 에러 JSON 전달
+    """
+    def __init__(self, tools: List[BaseTool]):
         self.tools_by_name: Dict[str, BaseTool] = {t.name: t for t in tools}
 
     def __call__(self, inputs: dict):
@@ -82,38 +93,105 @@ class LoggedToolNode:
                 continue
             try:
                 log.info(f"[tools] call -> {name} | args={args}")
-                result = tool.invoke(args)
-                # data_uri 같은 대용량은 로깅 생략
-                short = str(result)[:300] + ("..." if len(str(result)) > 300 else "")
-                log.info(f"[tools] ok <- {name} | preview={_ellipsize(short, 180)}")
+                result = tool.invoke(args)  # dict/list/str 가능
+                # data_uri 대용량이라 미리보기만 로그
+                preview = result
+                try:
+                    preview = json.dumps(result, ensure_ascii=False)[:300]
+                except Exception:
+                    preview = str(result)[:300]
+                log.info(f"[tools] ok <- {name} | preview={_ellipsize(preview, 180)}")
+
+                # ToolMessage content는 JSON 문자열로 통일
+                if isinstance(result, (dict, list)):
+                    content = json.dumps(result, ensure_ascii=False)
+                else:
+                    # str인 경우도 JSON 문자열로 감싸 파싱 가능하게
+                    content = json.dumps({"value": str(result)}, ensure_ascii=False)
+
                 outputs.append(
                     ToolMessage(
-                        content=str(result) if not isinstance(result, (dict, list)) else str(result),
+                        content=content,
                         name=name,
                         tool_call_id=call_id,
                     )
                 )
             except Exception as e:
                 log.exception(f"[tools] exception in '{name}': {e}")
+                err = {"error": "tool_failed", "name": name, "detail": str(e)}
                 outputs.append(
                     ToolMessage(
-                        content=f'{{"error":"tool_failed","name":"{name}","detail":"{str(e)}"}}',
+                        content=json.dumps(err, ensure_ascii=False),
                         name=name,
                         tool_call_id=call_id,
                     )
                 )
         return {"messages": outputs}
 
+def _extract_data_uris_from_tool(content: Any) -> List[str]:
+    """
+    ToolMessage의 JSON content에서 data_uri들을 추출한다.
+    image_recent / image_lookup 응답 형식: {"items":[{"filename","data_uri"}, ...]}
+    """
+    uris: List[str] = []
+    obj = None
+    if isinstance(content, str):
+        try:
+            obj = json.loads(content)
+        except Exception:
+            obj = None
+    elif isinstance(content, (dict, list)):
+        obj = content
+
+    if isinstance(obj, dict):
+        if isinstance(obj.get("data_uri"), str):
+            uris.append(obj["data_uri"])
+        items = obj.get("items")
+        if isinstance(items, list):
+            for it in items:
+                if isinstance(it, dict) and isinstance(it.get("data_uri"), str):
+                    uris.append(it["data_uri"])
+    elif isinstance(obj, list):
+        for it in obj:
+            if isinstance(it, dict) and isinstance(it.get("data_uri"), str):
+                uris.append(it["data_uri"])
+    return uris
+
+def vision_bridge(state: State):
+    """
+    ToolMessage 안에 data_uri가 있으면,
+    다음 agent 호출 전에 멀티모달 입력(HumanMessage with image_url)로 변환해 붙인다.
+    (gpt-4o-mini가 실제 이미지를 보고 장면을 요약 가능)
+    """
+    msgs = state.get("messages", [])
+    if not msgs:
+        return {}
+    last = msgs[-1]
+    role, content = _get_role_and_content(last)
+    if role != "tool" or not content:
+        return {}
+
+    # ToolMessage.content는 JSON 문자열; 여기서 data_uri만 뽑는다.
+    uris = _extract_data_uris_from_tool(last.content)
+    if not uris:
+        return {}
+
+    parts: List[dict] = [{"type": "text", "text": "이미지를 보고 핵심을 1문장, 이어서 최대 3포인트로 간단히 설명해줘."}]
+    for u in uris[:4]:  # 최대 4장
+        parts.append({"type": "image_url", "image_url": {"url": u}})
+
+    log.info(f"[vision_bridge] attach {len(uris[:4])} image(s)")
+    return {"messages": [HumanMessage(content=parts)]}
+
 def build_graph():
-    llm = ChatOpenAI(model="gpt-5-nano", temperature=1)
-    tools = get_tools()  # image_lookup, web_search(옵션), weather_now 포함
+    # 멀티모달 LLM로 교체 (이미지를 직접 볼 수 있음)
+    llm = ChatOpenAI(model="gpt-4o-mini", temperature=1)
+    tools = get_tools()
     llm_with_tools = llm.bind_tools(tools)
     model_struct = llm.with_structured_output(FinalResponse)
 
     def agent(state: State):
-        # 시스템 프롬프트를 항상 맨 앞에
         msgs = [SystemMessage(content=SYSTEM_PROMPT)] + state.get("messages", [])
-        # 마지막 메시지 로그
         if msgs:
             r, c = _get_role_and_content(msgs[-1])
             log.info(f"[agent] in | last_role={r} | last='{_ellipsize(c)}'")
@@ -157,7 +235,7 @@ def build_graph():
 
         # 3) 없으면 최신 user 문장으로 최소 생성 (드물게 발생하는 비정상 케이스)
         last_user = ""
-        for m in reversed(state["messages"]):
+        for m in reversed(state.get("messages", [])):
             role, content = _get_role_and_content(m)
             if role in ("human", "user") and content:
                 last_user = content
@@ -174,11 +252,13 @@ def build_graph():
     g = StateGraph(State)
     g.add_node("agent", agent)
     g.add_node("tools", LoggedToolNode(tools))
+    g.add_node("vision_bridge", vision_bridge)
     g.add_node("respond", respond)
 
     g.set_entry_point("agent")
     g.add_conditional_edges("agent", route, {"tools": "tools", "respond": "respond"})
-    g.add_edge("tools", "agent")
+    g.add_edge("tools", "vision_bridge")
+    g.add_edge("vision_bridge", "agent")
 
     memory = MemorySaver()
     app = g.compile(checkpointer=memory)

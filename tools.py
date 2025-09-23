@@ -2,7 +2,7 @@
 import os
 import logging
 import requests
-from typing import List, Dict, Any
+from typing import List, Dict, Any, Optional
 from dotenv import load_dotenv
 from langchain_core.tools import tool
 
@@ -10,7 +10,10 @@ load_dotenv()
 log = logging.getLogger("wearable.tools")
 
 IMAGE_API_BASE = os.getenv("IMAGE_API_BASE", "http://127.0.0.1:8000")
+# YOLO/GAZE 업링크 엔드포인트도 동일 FastAPI 안에 있으므로 기본은 IMAGE_API_BASE와 동일
+PERCEPTION_API_BASE = os.getenv("PERCEPTION_API_BASE", IMAGE_API_BASE)
 TAVILY_API_KEY = os.getenv("TAVILY_API_KEY")
+
 
 @tool("image_lookup")
 def image_lookup(query: str) -> Dict[str, Any]:
@@ -53,11 +56,10 @@ def image_lookup(query: str) -> Dict[str, Any]:
     [빈 결과]
     - items가 비면 "관련 이미지를 찾지 못했다"고 짧게 알리고,
       더 구체적 키워드 제안(예: '신호등' → '빨간 신호등') 후 재시도 유도.
-      (추후 /image/push, /image/recent 도입 시 그 경로로 업링크/최근 프레임을 안내)
+      (추후 /image/push, /image/recent 경로도 함께 안내 가능)
 
     [반환값]
-    - dict (그대로 LLM에게 전달): {"items": [{"filename":..., "data_uri":...}, ...]}
-      * 로깅 시 data_uri는 길 수 있으므로 길이만 요약/마스킹 권장.
+    - dict: {"items": [{"filename":..., "data_uri":...}, ...]}
     """
     log.debug(f"[image_lookup] q='{query}' -> GET {IMAGE_API_BASE}/image/search")
     r = requests.get(f"{IMAGE_API_BASE}/image/search", params={"q": query}, timeout=15)
@@ -66,6 +68,59 @@ def image_lookup(query: str) -> Dict[str, Any]:
     count = len(data.get("items", []))
     log.info(f"[image_lookup] q='{query}' | items={count}")
     return data
+
+
+@tool("image_recent")
+def image_recent(session_id: str, limit: int = 1) -> Dict[str, Any]:
+    """
+    [목적] 디바이스가 /image/push로 업로드한 '최근 프레임'을 가져옴.
+    [동작] GET {IMAGE_API_BASE}/image/recent?session_id=...&limit=...
+    [응답] {"items":[{"filename","data_uri"}, ...]}
+    [사용] 파일명/URI 낭독 금지. 장면만 말로 요약(1문장+최대3포인트).
+    """
+    log.debug(f"[image_recent] session_id='{session_id}', limit={limit}")
+    r = requests.get(
+        f"{IMAGE_API_BASE}/image/recent",
+        params={"session_id": session_id, "limit": limit},
+        timeout=10,
+    )
+    r.raise_for_status()
+    return r.json()
+
+
+@tool("yolo_scene")
+def yolo_scene(session_id: str, last: int = 1) -> Dict[str, Any]:
+    """
+    [목적] 최근 YOLO 검출 결과(JSON)를 가져와, LLM이 '차량 n대, 보행자 m명, 신호등 빨간불 → 대기' 식으로 요약.
+    [동작] GET {PERCEPTION_API_BASE}/perception/yolo/recent?session_id=...&last=...
+    [응답] {"items":[{ width,height, ts, detections:[{label,bbox,conf,...}], image_filename?, frame_id? }]}
+    """
+    log.debug(f"[yolo_scene] session_id='{session_id}', last={last}")
+    r = requests.get(
+        f"{PERCEPTION_API_BASE}/perception/yolo/recent",
+        params={"session_id": session_id, "last": last},
+        timeout=10,
+    )
+    r.raise_for_status()
+    return r.json()
+
+
+@tool("gaze_depth_status")
+def gaze_depth_status(session_id: str, last: int = 1) -> Dict[str, Any]:
+    """
+    [목적] 최근 시선/깊이/위험 인지 데이터를 가져와, LLM이 경고/행동 지침을 말하게 함.
+    [동작] GET {PERCEPTION_API_BASE}/perception/gaze/recent?session_id=...&last=...
+    [응답] {"items":[{gaze_xy_norm:[x,y], focus_dist_m, sudden_entry, hazards:[{kind,distance_m,rel_bearing_deg,risk}], ...}]}
+    """
+    log.debug(f"[gaze_depth_status] session_id='{session_id}', last={last}")
+    r = requests.get(
+        f"{PERCEPTION_API_BASE}/perception/gaze/recent",
+        params={"session_id": session_id, "last": last},
+        timeout=10,
+    )
+    r.raise_for_status()
+    return r.json()
+
 
 @tool("web_search")
 def web_search(query: str, max_results: int = 5) -> List[Dict[str, str]]:
@@ -96,6 +151,7 @@ def web_search(query: str, max_results: int = 5) -> List[Dict[str, str]]:
         log.exception(f"[web_search] exception: {e}")
         return results
 
+
 @tool("weather_now")
 def weather_now(lat: float, lon: float) -> dict:
     """
@@ -103,6 +159,7 @@ def weather_now(lat: float, lon: float) -> dict:
     Open-Meteo API로 현재 상태와 시간별 강수·기온 요약을 가져온다.
     응답을 말로 전달할 때는 수치를 반올림해 섭씨/미터초 기준으로 간결히 안내.
     """
+    log.debug(f"[weather_now] lat={lat}, lon={lon}")
     r = requests.get(
         "https://api.open-meteo.com/v1/forecast",
         params={
@@ -117,9 +174,14 @@ def weather_now(lat: float, lon: float) -> dict:
     r.raise_for_status()
     return r.json()
 
+
 def get_tools():
-    tools = [image_lookup]
+    """
+    사용 가능한 도구 목록을 반환.
+    - 기본: image_lookup, image_recent, yolo_scene, gaze_depth_status, weather_now
+    - Tavily 키가 있으면 web_search를 최우선으로 추가
+    """
+    tools = [image_lookup, image_recent, yolo_scene, gaze_depth_status, weather_now]
     if TAVILY_API_KEY:
         tools.insert(0, web_search)
-    tools.append(weather_now)
     return tools

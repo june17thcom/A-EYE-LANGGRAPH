@@ -1,17 +1,21 @@
 # schema.py
 from typing import List, Literal, Optional, Union
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, ConfigDict
 
-class ImageItem(BaseModel):
+# LLM이 가끔 추가 키를 넣어도 깨지지 않도록 extra='ignore'
+class SafeModel(BaseModel):
+    model_config = ConfigDict(extra="ignore")  # unknown fields 무시
+
+class ImageItem(SafeModel):
     filename: str = Field(description="이미지 파일명")
     data_uri: str = Field(description="data:URI (base64)")
 
-class RAGSource(BaseModel):
+class RAGSource(SafeModel):
     source: str
     url: Optional[str] = None
     snippet: Optional[str] = None
 
-class WearableConversationalResponse(BaseModel):
+class WearableConversationalResponse(SafeModel):
     intent: Literal["qa", "guide", "status", "control", "other"] = Field(
         description="사용자 의도 태그"
     )
@@ -26,11 +30,11 @@ class WearableConversationalResponse(BaseModel):
     )
     citations: List[RAGSource] = Field(default_factory=list)
 
-class WearableImageResponse(BaseModel):
+class WearableImageResponse(SafeModel):
     intent: Literal["image-insight", "image-lookup"] = "image-insight"
     answer: str
     images: List[ImageItem] = Field(default_factory=list)
     citations: List[RAGSource] = Field(default_factory=list)
 
-class FinalResponse(BaseModel):
+class FinalResponse(SafeModel):
     final_output: Union[WearableConversationalResponse, WearableImageResponse]

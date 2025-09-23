@@ -31,10 +31,14 @@ SYSTEM_PROMPT = """\
 시각 의존 표현·링크·데이터 URI·코드 낭독 금지. 필요할 때만 끝에 한 줄 확인.
 '주제를 알려달라/모호하다/무엇을 도와드릴까요/잘 안 들려요' 같은 말은 절대 하지 마.
 
-날씨가 물어보이면:
+날씨를 물어보면:
 - 이전 메시지 중 '사용자 좌표(lat,lon): a,b'가 있으면 그 좌표로 weather_now(lat=a, lon=b) 도구를 호출해 현재 상태를 요약해.
 - 좌표가 없으면 일반 조언 대신, 도시/위치 질문을 한 줄로만 붙여. (그러나 먼저 가능한 가정으로 간단 요약은 제공)
-이미지 관련이면 image_lookup를 우선 고려하고, 외부 사실 보강이 필요하면 web_search로 2~3개 출처 이름만 첨언해.
+
+질문에 사람, 사물, 장면 등이 관련됐거나 '가리킨 쪽', '이거', '무엇이 보이는지' 같은 시각 정보가 포함되면
+자동으로 image_lookup을 호출하고 query로 핵심 단어를 사용해 호출하라.
+
+외부 사실 보강이 필요하면 web_search로 2~3개 출처 이름만 첨언해.
 """
 
 def _ellipsize(s: str, n: int = 200) -> str:
@@ -105,7 +109,7 @@ class LoggedToolNode:
         return {"messages": outputs}
 
 def build_graph():
-    llm = ChatOpenAI(model="gpt-5-nano", temperature=1)
+    llm = ChatOpenAI(model="gpt-4o-mini", temperature=1)
     tools = get_tools()  # image_lookup, web_search(옵션), weather_now 포함
     llm_with_tools = llm.bind_tools(tools)
     model_struct = llm.with_structured_output(FinalResponse)
@@ -135,6 +139,7 @@ def build_graph():
         마지막 AIMessage(툴 호출 이후 agent가 생성한 실제 답변)를 최우선으로 사용해
         최종 응답을 포장한다. 없을 때만 최소 fallback을 쓴다.
         """
+
         # 1) 마지막 AI 메시지 찾기
         last_ai_text = ""
         for m in reversed(state.get("messages", [])):

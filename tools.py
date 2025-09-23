@@ -1,16 +1,64 @@
 # tools.py
 import os
 import logging
+from itertools import count
+
 import requests
 from typing import List, Dict, Any
 from dotenv import load_dotenv
 from langchain_core.tools import tool
-
+import os
+import logging
+from typing import Dict, Any
+from langchain_core.tools import tool
+from temp_img import image_to_base64  # 로컬 테스트용
 load_dotenv()
 log = logging.getLogger("wearable.tools")
 
 IMAGE_API_BASE = os.getenv("IMAGE_API_BASE", "http://127.0.0.1:8000")
 TAVILY_API_KEY = os.getenv("TAVILY_API_KEY")
+
+# 이미지 전처리(서버단 오류 잡기용)
+MAX_PAYLOAD_SIZE = 120_000  # command + base64 총합 제한 (byte 기준)
+MIN_DIM = 64  # 최소 리사이징 크기
+
+def safe_base64_for_llm(b64_str: str, command: str) -> str:
+    """
+    1. image_lookup 툴에서 서버 요청 후 받은 결과(res)를 확인
+    2. base64 + 사용자 쿼리 길이가 API 처리 제한 토큰 수(124k) 이상이면
+    3. 그대로 LLM에 전달하지 말고, 이미지 크기를 줄여
+    (디코딩 후 압축resizing, 다시 한 번 base64 인코딩: 평균 1.33배 가량 용량이 늘어나므로 기준은 img = resized_base64 * 1.33 < 124k - command)
+    안전하게 토큰 제한 내로 맞춤
+    """
+    from PIL import Image
+    import io, base64
+
+    # 1) 예상 크기 확인
+    total_len = len(command.encode("utf-8")) + len(b64_str.encode("utf-8"))
+    if total_len <= MAX_PAYLOAD_SIZE:
+        return b64_str
+
+    # 2) base64 → 이미지 디코딩
+    img_data = base64.b64decode(b64_str)
+    img = Image.open(io.BytesIO(img_data))
+
+    # 3) 반복 리사이즈: payload < MAX_PAYLOAD_SIZE
+    while total_len > MAX_PAYLOAD_SIZE:
+        w, h = img.size
+        if w <= MIN_DIM or h <= MIN_DIM:
+            break  # 최소 크기 이하이면 강제 종료
+        img = img.resize((w // 2, h // 2))  # 1/2 리사이즈
+        # 재인코딩
+        buf = io.BytesIO()
+        img.save(buf, format="JPEG", quality=85)
+        b64_str = base64.b64encode(buf.getvalue()).decode("utf-8")
+        total_len = len(command.encode("utf-8")) + len(b64_str.encode("utf-8"))
+
+    return b64_str
+
+
+# 임시 - 삭제 예정
+from temp_img import image_to_base64
 
 @tool("image_lookup")
 def image_lookup(query: str) -> Dict[str, Any]:
@@ -59,6 +107,7 @@ def image_lookup(query: str) -> Dict[str, Any]:
     - dict (그대로 LLM에게 전달): {"items": [{"filename":..., "data_uri":...}, ...]}
       * 로깅 시 data_uri는 길 수 있으므로 길이만 요약/마스킹 권장.
     """
+    '''
     log.debug(f"[image_lookup] q='{query}' -> GET {IMAGE_API_BASE}/image/search")
     r = requests.get(f"{IMAGE_API_BASE}/image/search", params={"q": query}, timeout=15)
     r.raise_for_status()
@@ -66,6 +115,68 @@ def image_lookup(query: str) -> Dict[str, Any]:
     count = len(data.get("items", []))
     log.info(f"[image_lookup] q='{query}' | items={count}")
     return data
+    '''
+    print("이미지 연산 시작: 로컬 base64 테스트 모드")
+    """
+            멀티모달 LLM와 연계 가능한 이미지 조회/연산용 툴.
+
+            동작:
+            1) 서버 IMAGE_API_BASE에 GET 요청하여 BASE64 이미지 획득
+            2) 실패 시 로컬 이미지 사용
+            3) 반환값은 LLM에서 바로 처리 가능하도록 dict 구조
+            """
+    try:
+        # --- 서버 호출 버전 ---
+        # log.debug(f"[image_lookup] q='{query}' -> GET {IMAGE_API_BASE}/image/search")
+        # r = requests.get(f"{IMAGE_API_BASE}/image/search", params={"q": query}, timeout=15)
+        # r.raise_for_status()
+        # data = r.json()
+        # return data
+        '''
+        try:
+        # --- 서버 호출 버전 ---
+        log.debug(f"[image_lookup] q='{query}' -> GET {IMAGE_API_BASE}/image/search")
+        r = requests.get(f"{IMAGE_API_BASE}/image/search", params={"q": query}, timeout=15)
+        r.raise_for_status()
+        data = r.json()
+
+        # items 안에 data_uri가 들어온다고 가정
+        items = data.get("items", [])
+        for item in items:
+            if "data_uri" in item and item["data_uri"].startswith("data:image"):
+                # 헤더 분리
+                header, b64_str = item["data_uri"].split(",", 1)
+                safe_b64 = safe_base64_for_llm(b64_str, query)
+                item["data_uri"] = f"{header},{safe_b64}"
+
+        log.info(f"[image_lookup] q='{query}' | items={len(items)} (서버)")
+        return {"query": query, "items": items}
+        '''
+
+        # --- 로컬 테스트 버전 ---
+        log.info("[image_lookup] 서버 연결 실패, 로컬 이미지 테스트 모드")
+        b64_str = image_to_base64(
+            "C:\\Users\\ljcho\\Downloads\\A-EYE-LANGGRAPH\\images\\지하철일상.jpg"
+        )
+        command_text = f"사용자 질문: {query}"
+        print(command_text)
+
+        b64_str_safe = safe_base64_for_llm(b64_str, command_text)
+        print(b64_str_safe[:40])
+        data = {
+            "items": [
+                {
+                    "filename": "지하철일상.jpg",
+                    "data_uri": f"data:image/jpeg;base64,{b64_str_safe}"
+                }
+            ]
+        }
+        return {"query": query, "items": data["items"]}
+
+    except Exception as e:
+        log.exception(f"[image_lookup] 이미지 처리 실패: {e}")
+        return {"items": []}
+
 
 @tool("web_search")
 def web_search(query: str, max_results: int = 5) -> List[Dict[str, str]]:

@@ -9,11 +9,17 @@ WORKDIR /app
 # 시스템 의존성 (필요 최소)
 RUN apt-get update && apt-get install -y --no-install-recommends \
     build-essential curl ca-certificates \
+    portaudio19-dev \
+    libasound-dev \
+    libgl1 \
+    libsm6 \
+    libxext6 \
+    ffmpeg \
  && rm -rf /var/lib/apt/lists/*
 
 # 파이썬 패키지
 COPY requirements.txt .
-RUN pip install -r requirements.txt
+RUN pip install --no-cache-dir -r requirements.txt
 
 # 앱 복사
 COPY . .
